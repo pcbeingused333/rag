@@ -41,7 +41,6 @@ class KafkaEventConsumer:
         self.kafka_consumer = KafkaConsumer(
             cfg.KAFKA_TOPIC,
             bootstrap_servers=cfg.KAFKA_BOOTSTRAP_SERVERS.split(','),
-            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
             group_id=cfg.KAFKA_CONSUMER_GROUP,
             auto_offset_reset=cfg.KAFKA_AUTO_OFFSET_RESET,
             enable_auto_commit=True,
@@ -54,6 +53,30 @@ class KafkaEventConsumer:
         logger.info("Kafka consumer initialized")
         logger.info(f"Registered handlers: {list(self.handlers.keys())}")
     
+    @staticmethod
+    def _decode_message(message) -> Optional[dict]:
+        """Decode a message value as a JSON object, or return None if malformed.
+
+        Decoding happens here rather than in a ``value_deserializer`` because
+        kafka-python runs deserializers inside ``poll()``, so one malformed
+        message would raise out of the poll loop and stop the consumer.
+        """
+        try:
+            value = json.loads(message.value.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as e:
+            logger.error(
+                f"Skipping malformed message at partition {message.partition}, "
+                f"offset {message.offset}: {e}"
+            )
+            return None
+        if not isinstance(value, dict):
+            logger.error(
+                f"Skipping non-object message at partition {message.partition}, "
+                f"offset {message.offset}"
+            )
+            return None
+        return value
+
     def process_event(self, raw_event: dict) -> Optional[HandlerResult]:
         """Process a single MinIO S3 event."""
         start_time = datetime.now()
@@ -178,7 +201,9 @@ class KafkaEventConsumer:
                     f"[{message_count}] Message from "
                     f"partition {message.partition}, offset {message.offset}"
                 )
-                self.process_event(message.value)
+                event = self._decode_message(message)
+                if event is not None:
+                    self.process_event(event)
                             
         except KeyboardInterrupt:
             logger.info("Shutting down...")
